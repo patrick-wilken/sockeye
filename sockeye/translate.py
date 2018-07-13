@@ -17,32 +17,31 @@ Translation CLI.
 import argparse
 import sys
 import time
+from math import ceil
 from contextlib import ExitStack
-from typing import Generator, Optional, List
+from typing import Optional, Iterable
 
 import mxnet as mx
-from math import ceil
 
+import sockeye
+import sockeye.arguments as arguments
+import sockeye.constants as C
+import sockeye.data_io
+import sockeye.inference
 from sockeye.lexicon import TopKLexicon
+import sockeye.output_handler
 from sockeye.log import setup_main_logger
-from sockeye.output_handler import get_output_handler, OutputHandler
-from sockeye.utils import acquire_gpus, get_num_gpus, log_basic_info, check_condition, grouper
-from . import arguments
-from . import constants as C
-from . import data_io
-from . import inference
+from sockeye.utils import acquire_gpus, get_num_gpus, log_basic_info
+from sockeye.utils import check_condition, grouper
+
 
 logger = setup_main_logger(__name__, file_logging=False)
 
 
 def main():
-    params = arguments.ConfigArgumentParser(description='Translate CLI')
+    params = argparse.ArgumentParser(description='Translate CLI')
     arguments.add_translate_cli_args(params)
     args = params.parse_args()
-    run_translate(args)
-
-
-def run_translate(args: argparse.Namespace):
 
     if args.output is not None:
         global logger
@@ -54,118 +53,54 @@ def run_translate(args: argparse.Namespace):
     if args.checkpoints is not None:
         check_condition(len(args.checkpoints) == len(args.models), "must provide checkpoints for each model")
 
-    if args.beam_search_stop == C.BEAM_SEARCH_STOP_FIRST:
-        check_condition(args.batch_size == 1,
-                        "Early stopping (--beam-search-stop %s) not supported with batching" % (C.BEAM_SEARCH_STOP_FIRST))
-
     log_basic_info(args)
 
-    output_handler = get_output_handler(args.output_type,
-                                        args.output,
-                                        args.sure_align_threshold)
+    output_handler = sockeye.output_handler.get_output_handler(args.output_type,
+                                                               args.output,
+                                                               args.sure_align_threshold)
 
     with ExitStack() as exit_stack:
         context = _setup_context(args, exit_stack)
 
-        if args.override_dtype == C.DTYPE_FP16:
-            logger.warning('Experimental feature \'--override-dtype float16\' has been used. '
-                           'This feature may be removed or change its behaviour in future. '
-                           'DO NOT USE IT IN PRODUCTION!')
-
-        models, source_vocabs, target_vocab = inference.load_models(
-            context=context,
-            max_input_len=args.max_input_len,
-            beam_size=args.beam_size,
-            batch_size=args.batch_size,
-            model_folders=args.models,
-            checkpoints=args.checkpoints,
-            softmax_temperature=args.softmax_temperature,
-            max_output_length_num_stds=args.max_output_length_num_stds,
+        models, vocab_source, vocab_target = sockeye.inference.load_models(
+            context,
+            args.max_input_len,
+            args.beam_size,
+            args.batch_size,
+            args.models,
+            args.checkpoints,
+            args.softmax_temperature,
+            args.max_output_length_num_stds,
             decoder_return_logit_inputs=args.restrict_lexicon is not None,
-            cache_output_layer_w_b=args.restrict_lexicon is not None,
-            override_dtype=args.override_dtype)
-        restrict_lexicon = None  # type: Optional[TopKLexicon]
+            cache_output_layer_w_b=args.restrict_lexicon is not None)
+        restrict_lexicon = None # type: TopKLexicon
         if args.restrict_lexicon:
-            restrict_lexicon = TopKLexicon(source_vocabs[0], target_vocab)
-            restrict_lexicon.load(args.restrict_lexicon, k=args.restrict_lexicon_topk)
-        store_beam = args.output_type == C.OUTPUT_HANDLER_BEAM_STORE
-        translator = inference.Translator(context=context,
-                                          ensemble_mode=args.ensemble_mode,
-                                          bucket_source_width=args.bucket_width,
-                                          length_penalty=inference.LengthPenalty(args.length_penalty_alpha,
-                                                                                 args.length_penalty_beta),
-                                          beam_prune=args.beam_prune,
-                                          beam_search_stop=args.beam_search_stop,
-                                          models=models,
-                                          source_vocabs=source_vocabs,
-                                          target_vocab=target_vocab,
-                                          restrict_lexicon=restrict_lexicon,
-                                          store_beam=store_beam,
-                                          strip_unknown_words=args.strip_unknown_words)
-        read_and_translate(translator=translator,
-                           output_handler=output_handler,
-                           chunk_size=args.chunk_size,
-                           input_file=args.input,
-                           input_factors=args.input_factors,
-                           input_is_json=args.json_input)
+            restrict_lexicon = TopKLexicon(vocab_source, vocab_target)
+            restrict_lexicon.load(args.restrict_lexicon)
+        translator = sockeye.inference.Translator(context,
+                                                  args.ensemble_mode,
+                                                  args.bucket_width,
+                                                  sockeye.inference.LengthPenalty(args.length_penalty_alpha,
+                                                                                  args.length_penalty_beta),
+                                                  models,
+                                                  vocab_source,
+                                                  vocab_target,
+                                                  restrict_lexicon)
+        read_and_translate(translator, output_handler, args.chunk_size, args.input)
 
 
-def make_inputs(input_file: Optional[str],
-                translator: inference.Translator,
-                input_is_json: bool,
-                input_factors: Optional[List[str]] = None) -> Generator[inference.TranslatorInput, None, None]:
-    """
-    Generates TranslatorInput instances from input. If input is None, reads from stdin. If num_input_factors > 1,
-    the function will look for factors attached to each token, separated by '|'.
-    If source is not None, reads from the source file. If num_source_factors > 1, num_source_factors source factor
-    filenames are required.
-
-    :param input_file: The source file (possibly None).
-    :param translator: Translator that will translate each line of input.
-    :param input_is_json: Whether the input is in json format.
-    :param input_factors: Source factor files.
-    :return: TranslatorInput objects.
-    """
-    if input_file is None:
-        check_condition(input_factors is None, "Translating from STDIN, not expecting any factor files.")
-        for sentence_id, line in enumerate(sys.stdin, 1):
-            if input_is_json:
-                yield inference.make_input_from_json_string(sentence_id=sentence_id, json_string=line)
-            else:
-                yield inference.make_input_from_factored_string(sentence_id=sentence_id,
-                                                                factored_string=line,
-                                                                translator=translator)
-    else:
-        input_factors = [] if input_factors is None else input_factors
-        inputs = [input_file] + input_factors
-        check_condition(translator.num_source_factors == len(inputs),
-                        "Model(s) require %d factors, but %d given (through --input and --input-factors)." % (
-                            translator.num_source_factors, len(inputs)))
-        with ExitStack() as exit_stack:
-            streams = [exit_stack.enter_context(data_io.smart_open(i)) for i in inputs]
-            for sentence_id, inputs in enumerate(zip(*streams), 1):
-                if input_is_json:
-                    yield inference.make_input_from_json_string(sentence_id=sentence_id, json_string=inputs[0])
-                else:
-                    yield inference.make_input_from_multiple_strings(sentence_id=sentence_id, strings=list(inputs))
-
-
-def read_and_translate(translator: inference.Translator,
-                       output_handler: OutputHandler,
-                       chunk_size: Optional[int],
-                       input_file: Optional[str] = None,
-                       input_factors: Optional[List[str]] = None,
-                       input_is_json: bool = False) -> None:
+def read_and_translate(translator: sockeye.inference.Translator, output_handler: sockeye.output_handler.OutputHandler,
+                       chunk_size: Optional[int], source: Optional[str] = None) -> None:
     """
     Reads from either a file or stdin and translates each line, calling the output_handler with the result.
 
     :param output_handler: Handler that will write output to a stream.
     :param translator: Translator that will translate each line of input.
     :param chunk_size: The size of the portion to read at a time from the input.
-    :param input_file: Optional path to file which will be translated line-by-line if included, if none use stdin.
-    :param input_factors: Optional list of paths to files that contain source factors.
-    :param input_is_json: Whether the input is in json format.
+    :param source: Path to file which will be translated line-by-line if included, if none use stdin.
     """
+    source_data = sys.stdin if source is None else sockeye.data_io.smart_open(source)
+
     batch_size = translator.batch_size
     if chunk_size is None:
         if translator.batch_size == 1:
@@ -177,14 +112,14 @@ def read_and_translate(translator: inference.Translator,
     else:
         if chunk_size < translator.batch_size:
             logger.warning("You specified a chunk size (%d) smaller than the batch size (%d). This will lead to "
-                           "a reduction in translation speed. Consider choosing a larger chunk size." % (chunk_size,
-                                                                                                         batch_size))
+                           "a degregation of translation speed. Consider choosing a larger chunk size." % (chunk_size,
+                                                                                                           batch_size))
 
     logger.info("Translating...")
 
     total_time, total_lines = 0.0, 0
-    for chunk in grouper(make_inputs(input_file, translator, input_is_json, input_factors), size=chunk_size):
-        chunk_time = translate(output_handler, chunk, translator)
+    for chunk in grouper(source_data, chunk_size):
+        chunk_time = translate(output_handler, chunk, translator, total_lines)
         total_lines += len(chunk)
         total_time += chunk_time
 
@@ -196,18 +131,20 @@ def read_and_translate(translator: inference.Translator,
         logger.info("Processed 0 lines.")
 
 
-def translate(output_handler: OutputHandler,
-              trans_inputs: List[inference.TranslatorInput],
-              translator: inference.Translator) -> float:
+def translate(output_handler: sockeye.output_handler.OutputHandler, source_data: Iterable[str],
+                    translator: sockeye.inference.Translator, chunk_id: int = 0) -> float:
     """
     Translates each line from source_data, calling output handler after translating a batch.
 
     :param output_handler: A handler that will be called once with the output of each translation.
-    :param trans_inputs: A enumerable list of translator inputs.
+    :param source_data: A enumerable list of source sentences that will be translated.
     :param translator: The translator that will be used for each line of input.
+    :param chunk_id: Global id of the chunk.
     :return: Total time taken.
     """
+
     tic = time.time()
+    trans_inputs = [translator.make_input(i, line) for i, line in enumerate(source_data, chunk_id + 1)]
     trans_outputs = translator.translate(trans_inputs)
     total_time = time.time() - tic
     batch_time = total_time / len(trans_inputs)
