@@ -72,6 +72,22 @@ class OutputHandler(ABC):
         pass
 
 
+class QueryOutputHandler(OutputHandler):
+    def __init__(self):
+        self.translation = ""
+
+    def handle(self,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
+               t_walltime: float = 0.):
+      self.translation += t_output.translation + '\n'
+
+    def get_translation(self):
+      translation = self.translation
+      self.translation = ""
+      return translation
+
+
 class StringOutputHandler(OutputHandler):
     """
     Output handler to write translation to a stream
